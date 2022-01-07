@@ -21,6 +21,8 @@
 
 #include <lcpng/lcpng_interface.h>
 #include <netlink/route/link/vlan.h>
+#include <netlink/route/link/vxlan.h>
+
 #include <linux/if_ether.h>
 
 #include <vnet/plugin/plugin.h>
@@ -38,6 +40,8 @@
 #include <vnet/devices/netlink.h>
 #include <vlibapi/api_helper_macros.h>
 #include <vnet/ipsec/ipsec_punt.h>
+#include <vnet/vxlan/vxlan.h>
+
 
 vlib_log_class_t lcp_itf_pair_logger;
 
@@ -256,7 +260,8 @@ lcp_itf_pair_add (u32 host_sw_if_index, u32 phy_sw_if_index, u8 *host_name,
   vec_validate_init_empty (lip_db_by_phy, phy_sw_if_index, INDEX_INVALID);
   vec_validate_init_empty (lip_db_by_host, host_sw_if_index, INDEX_INVALID);
   lip_db_by_phy[phy_sw_if_index] = lipi;
-  lip_db_by_host[host_sw_if_index] = lipi;
+  if (lip->lip_host_type != LCP_ITF_HOST_VXLAN)
+    lip_db_by_host[host_sw_if_index] = lipi;
   hash_set (lip_db_by_vif, host_index, lipi);
 
   lip->lip_host_sw_if_index = host_sw_if_index;
@@ -265,6 +270,10 @@ lcp_itf_pair_add (u32 host_sw_if_index, u32 phy_sw_if_index, u8 *host_name,
   lip->lip_host_type = host_type;
   lip->lip_vif_index = host_index;
   lip->lip_namespace = vec_dup (ns);
+
+  /* vxlan port is special to treat */
+  if (lip->lip_host_type == LCP_ITF_HOST_VXLAN)
+    return 0;
 
   /*
    * First use of this host interface.
@@ -340,10 +349,11 @@ lcp_netlink_add_link_vlan (int parent, u32 vlan, u16 proto, const char *name)
   int err;
 
   sk = nl_socket_alloc ();
-  if ((err = nl_connect (sk, NETLINK_ROUTE)) < 0) {
-    LCP_ITF_PAIR_ERR ("netlink_add_link_vlan: connect error: %s", nl_geterror(err));
-    return clib_error_return (NULL, "Unable to connect socket: %d", err);
-  }
+  if ((err = nl_connect (sk, NETLINK_ROUTE)) < 0)
+    {
+      LCP_ITF_PAIR_ERR ("netlink_add_link_vlan: connect error: %s", nl_geterror(err));
+      return clib_error_return (NULL, "Unable to connect socket: %d", err);
+    }
 
   link = rtnl_link_vlan_alloc ();
 
@@ -352,15 +362,120 @@ lcp_netlink_add_link_vlan (int parent, u32 vlan, u16 proto, const char *name)
   rtnl_link_vlan_set_id (link, vlan);
   rtnl_link_vlan_set_protocol (link, htons (proto));
 
-  if ((err = rtnl_link_add (sk, link, NLM_F_CREATE)) < 0) {
-    LCP_ITF_PAIR_ERR ("netlink_add_link_vlan: link add error: %s", nl_geterror(err));
-    return clib_error_return (NULL, "Unable to add link %s: %d", name, err);
-  }
+  if ((err = rtnl_link_add (sk, link, NLM_F_CREATE)) < 0)
+    {
+      LCP_ITF_PAIR_ERR ("netlink_add_link_vlan: link add error: %s", nl_geterror(err));
+      rtnl_link_put (link);
+      nl_close (sk);
+      return clib_error_return (NULL, "Unable to add link %s: %d", name, err);
+    }
+  else
+    {
+      rtnl_link_put (link);
+      nl_close (sk);
+      return NULL;
+   }
+}
 
+static int
+lcp_netlink_add_link_vxlan (int parent, u32 vni, const char *name,
+        struct nl_addr *local, struct nl_addr *group, u16 port, u8 learning)
+{
+  struct rtnl_link *link;
+  struct nl_sock *sk;
+  int err = 0;
+
+  sk = nl_socket_alloc ();
+  if ((err = nl_connect (sk, NETLINK_ROUTE)) < 0) 
+    {
+      LCP_ITF_PAIR_ERR ("netlink_add_link_vxlan: connect error: %s",
+                        nl_geterror(err));
+      return err;
+    }
+
+  link = rtnl_link_vxlan_alloc ();
+
+  rtnl_link_vxlan_set_link (link, parent);
+  rtnl_link_set_name (link, name);
+  rtnl_link_vxlan_set_id (link, vni);
+  rtnl_link_vxlan_set_local (link, local);
+  //rtnl_link_vxlan_set_group (link, group);
+  rtnl_link_vxlan_set_port (link, port);
+  rtnl_link_vxlan_set_learning (link, learning);
+
+  if ((err = rtnl_link_add (sk, link, NLM_F_CREATE)) < 0)
+    {
+      LCP_ITF_PAIR_ERR ("netlink_add_link_vlan: add link %name, err: %s",
+                        name, nl_geterror(err));
+      goto end;
+    }
+
+end:
   rtnl_link_put (link);
   nl_close (sk);
+  return err;
+}
 
-  return NULL;
+static int
+lcp_netlink_set_vxlan_master(u32 vni, const char* host_if_name)
+{
+  struct rtnl_link *link, *vxlan_link;
+  struct nl_sock *sk;
+  struct nl_cache *cache;
+  char brname[128] = {'\0'};
+  int err = 0;
+  
+  sk = nl_socket_alloc ();
+  if ((err = nl_connect (sk, NETLINK_ROUTE)) < 0)
+    {
+      LCP_ITF_PAIR_ERR ("netlink_add_link_bridge: connect error: %s",
+                        nl_geterror(err));
+      return err;
+    }
+
+  link = rtnl_link_alloc();
+
+  rtnl_link_set_type(link, "bridge");
+  sprintf(brname, "br%d", vni);
+  rtnl_link_set_name(link, brname);
+  rtnl_link_set_flags(link, IFF_UP);
+  rtnl_link_set_operstate(link, IF_OPER_UP);
+
+  if ((err = rtnl_link_add (sk, link, NLM_F_CREATE)) < 0)
+    {
+      LCP_ITF_PAIR_ERR ("Unable to add link: %s err %s",
+                        host_if_name, nl_geterror(err));
+      goto end;
+    }
+
+  rtnl_link_alloc_cache(sk, AF_UNSPEC, &cache);
+  nl_cache_refill(sk, cache);
+
+  link = rtnl_link_get_by_name(cache, brname);
+  vxlan_link = rtnl_link_get_by_name(cache, host_if_name);
+  rtnl_link_enslave(sk, link, vxlan_link);
+  nl_cache_put(cache);
+
+end:
+  rtnl_link_put (link);
+  nl_close(sk);
+
+  return err;
+}
+
+static bool 
+is_vxlan_if(u32 phy_sw_if_index) 
+{
+  vxlan_main_t *vxm = &vxlan_main;
+  vxlan_tunnel_t *t;
+
+  pool_foreach (t, vxm->tunnels)
+   {
+     if (t->sw_if_index == phy_sw_if_index)
+       return true;
+   }
+
+   return false;
 }
 
 static clib_error_t *
@@ -414,6 +529,9 @@ lcp_itf_pair_del (u32 phy_sw_if_index)
 	vft->pair_del_fn (lip);
     }
 
+  if (is_vxlan_if(phy_sw_if_index))
+    goto end;
+
   FOR_EACH_IP_ADDRESS_FAMILY (af)
   ip_feature_enable_disable (af, N_SAFI, IP_FEATURE_INPUT,
 			     lcp_itf_l3_feat_names[lip->lip_host_type][af],
@@ -440,6 +558,7 @@ lcp_itf_pair_del (u32 phy_sw_if_index)
                                   0);
     }
 
+end:
   lip_db_by_phy[phy_sw_if_index] = INDEX_INVALID;
   lip_db_by_host[lip->lip_host_sw_if_index] = INDEX_INVALID;
   hash_unset (lip_db_by_vif, lip->lip_vif_index);
@@ -467,7 +586,8 @@ lcp_itf_pair_delete_by_index (index_t lipi)
 
   lcp_itf_pair_del (lip->lip_phy_sw_if_index);
 
-  if (vnet_sw_interface_is_sub (vnet_get_main (), host_sw_if_index))
+  if (vnet_sw_interface_is_sub (vnet_get_main (), host_sw_if_index)
+        || is_vxlan_if(lip->lip_phy_sw_if_index))
     {
       int curr_ns_fd = -1;
       int vif_ns_fd = -1;
@@ -489,7 +609,8 @@ lcp_itf_pair_delete_by_index (index_t lipi)
 	  close (curr_ns_fd);
 	}
 
-      vnet_delete_sub_interface (host_sw_if_index);
+      if (vnet_sw_interface_is_sub (vnet_get_main (), host_sw_if_index))
+        vnet_delete_sub_interface (host_sw_if_index);
     }
   else
     tap_delete_if (vlib_get_main (), host_sw_if_index);
@@ -747,6 +868,19 @@ lcp_itf_pair_find_by_outer_vlan (u32 sup_if_index, u16 vlan, bool dot1ad)
   return lip_db_by_phy[match.matched_sw_if_index];
 }
 
+static void
+lcp_addr46_to_nl (struct nl_addr **rna, ip46_address_t *ia)
+{
+  int family = AF_INET;
+
+  if (!ip46_address_is_ip4(ia))
+    family = AF_INET6;
+
+  u8* s = format (0, "%U", format_ip46_address, ia,
+		     (family == AF_INET) ? IP46_TYPE_IP4: IP46_TYPE_IP6);
+  nl_addr_parse((char *)s, AF_INET, rna);
+}
+
 int
 lcp_itf_pair_create (u32 phy_sw_if_index, u8 *host_if_name,
 		     lip_host_type_t host_if_type, u8 *ns,
@@ -758,25 +892,29 @@ lcp_itf_pair_create (u32 phy_sw_if_index, u8 *host_if_name,
   const vnet_sw_interface_t *sw;
   const vnet_hw_interface_t *hw;
   lcp_itf_pair_t *lip;
+  int orig_ns_fd = -1, vif_ns_fd = -1;
+  clib_error_t *err = NULL;
 
-  if (!vnet_sw_if_index_is_api_valid (phy_sw_if_index)) {
-    LCP_ITF_PAIR_ERR ("pair_create: invalid phy index %u", phy_sw_if_index);
-    return VNET_API_ERROR_INVALID_SW_IF_INDEX;
-  }
+  if (!vnet_sw_if_index_is_api_valid (phy_sw_if_index))
+    {
+      LCP_ITF_PAIR_ERR ("pair_create: invalid phy index %u", phy_sw_if_index);
+      return VNET_API_ERROR_INVALID_SW_IF_INDEX;
+    }
 
-  if (!lcp_validate_if_name (host_if_name)) {
-    LCP_ITF_PAIR_ERR ("pair_create: invalid host-if-name '%s'", host_if_name);
-    return VNET_API_ERROR_INVALID_ARGUMENT;
-  }
+  if (!lcp_validate_if_name (host_if_name))
+    {
+      LCP_ITF_PAIR_ERR ("pair_create: invalid host-if-name '%s'", host_if_name);
+      return VNET_API_ERROR_INVALID_ARGUMENT;
+    }
 
   vnm = vnet_get_main ();
   sw = vnet_get_sw_interface (vnm, phy_sw_if_index);
   hw = vnet_get_sup_hw_interface (vnm, phy_sw_if_index);
-  if (!sw && !hw) {
-    LCP_ITF_PAIR_ERR ("pair_create: invalid interface");
-    return VNET_API_ERROR_INVALID_SW_IF_INDEX;
-  }
-
+  if (!sw && !hw)
+    {
+      LCP_ITF_PAIR_ERR ("pair_create: invalid interface");
+      return VNET_API_ERROR_INVALID_SW_IF_INDEX;
+    }
 
   /*
    * Use interface-specific netns if supplied.
@@ -785,12 +923,69 @@ lcp_itf_pair_create (u32 phy_sw_if_index, u8 *host_if_name,
   if (ns == 0 || ns[0] == 0)
     ns = lcp_get_default_ns();
 
+  vxlan_main_t *vxm = &vxlan_main;
+  vxlan_tunnel_t *t;
+  u8 is_vlxan_int = 0;
+  struct nl_addr *local = 0, *group = 0;
+
+  pool_foreach (t, vxm->tunnels)
+    {
+      if (t->sw_if_index == phy_sw_if_index)
+	{
+	  is_vlxan_int = 1;
+	  break;
+	}
+    }
+
+  if (is_vlxan_int || vnet_sw_interface_is_sub (vnm, phy_sw_if_index))
+    {
+      orig_ns_fd = vif_ns_fd = -1;
+      if (ns && ns[0] != 0)
+	{
+	  orig_ns_fd = clib_netns_open (NULL /* self */);
+	  vif_ns_fd = clib_netns_open (ns);
+	  if (orig_ns_fd == -1 || vif_ns_fd == -1)
+	    goto socket_close;
+
+	  clib_setns (vif_ns_fd);
+	}
+    }
+
+  if (is_vlxan_int)
+    {
+      /* check host vxlan port exist */
+      vif_index = if_nametoindex ((const char *) host_if_name);
+      if (vif_index)
+	lcp_netlink_del_link((const char *) host_if_name);
+
+      int ret = 0;
+      host_sw_if_index = 0;
+
+      LCP_ITF_PAIR_INFO(
+	"pair_create: vlxan %s %s port %d phy_sw_if_index %d host_if_index %d",
+	format (0, " src %U", format_ip46_address, &t->src, IP46_TYPE_IP4),
+	format (0, " dst %U", format_ip46_address, &t->dst, IP46_TYPE_IP4),
+		t->dst_port, phy_sw_if_index, host_sw_if_index);
+
+      lcp_addr46_to_nl(&local, &t->src);
+      lcp_addr46_to_nl(&group, &t->dst);
+      ret = lcp_netlink_add_link_vxlan (0, t->vni,  (const char *)host_if_name,
+				local, group, t->dst_port, 0);
+      nl_addr_put(local);
+      nl_addr_put(group);
+
+      ret = lcp_netlink_set_vxlan_master(t->vni, (const char *)host_if_name);
+      host_if_type = LCP_ITF_HOST_VXLAN;
+
+      if (!ret)
+	vif_index = if_nametoindex ((const char *) host_if_name);
+      else 
+        return -1;
+    }
   /* sub interfaces do not need a tap created */
-  if (vnet_sw_interface_is_sub (vnm, phy_sw_if_index))
+  else if (vnet_sw_interface_is_sub (vnm, phy_sw_if_index))
     {
       index_t parent_if_index;
-      int orig_ns_fd, vif_ns_fd;
-      clib_error_t *err;
       u16 outer_vlan, inner_vlan;
       u16 outer_proto, inner_proto;
       u16 vlan, proto;
@@ -832,18 +1027,7 @@ lcp_itf_pair_create (u32 phy_sw_if_index, u8 *host_if_name,
       /*
        * see if the requested host interface has already been created
        */
-      orig_ns_fd = vif_ns_fd = -1;
       err = NULL;
-
-      if (ns && ns[0] != 0)
-	{
-	  orig_ns_fd = clib_netns_open (NULL /* self */);
-	  vif_ns_fd = clib_netns_open (ns);
-	  if (orig_ns_fd == -1 || vif_ns_fd == -1)
-	    goto socket_close;
-
-	  clib_setns (vif_ns_fd);
-	}
 
       vif_index = if_nametoindex ((const char *) host_if_name);
 
@@ -926,18 +1110,6 @@ lcp_itf_pair_create (u32 phy_sw_if_index, u8 *host_if_name,
 	    inner_vlan, format_vnet_sw_if_index_name, vnet_get_main (),
 	    lip->lip_host_sw_if_index);
 	}
-
-    socket_close:
-      if (orig_ns_fd != -1)
-	{
-	  clib_setns (orig_ns_fd);
-	  close (orig_ns_fd);
-	}
-      if (vif_ns_fd != -1)
-	close (vif_ns_fd);
-
-      if (err)
-	return VNET_API_ERROR_INVALID_ARGUMENT;
     }
   else
     {
@@ -1041,6 +1213,18 @@ lcp_itf_pair_create (u32 phy_sw_if_index, u8 *host_if_name,
 
   if (host_sw_if_indexp)
     *host_sw_if_indexp = host_sw_if_index;
+
+socket_close:
+  if (orig_ns_fd != -1)
+    {
+      clib_setns (orig_ns_fd);
+      close (orig_ns_fd);
+    }
+  if (vif_ns_fd != -1)
+    close (vif_ns_fd);
+
+  if (err)
+    return VNET_API_ERROR_INVALID_ARGUMENT;
 
   return 0;
 }

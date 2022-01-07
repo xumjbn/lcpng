@@ -52,6 +52,7 @@ typedef enum
 {
   LCP_ITF_HOST_TAP = 0,
   LCP_ITF_HOST_TUN = 1,
+  LCP_ITF_HOST_VXLAN = 2,
 } lip_host_type_t;
 
 #define N_LCP_ITF_HOST (LCP_ITF_HOST_TUN + 1)

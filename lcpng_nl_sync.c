@@ -34,6 +34,9 @@
 #include <vnet/ip-neighbor/ip_neighbor.h>
 #include <vnet/ip/ip6_link.h>
 
+#include <vnet/vxlan/vxlan.h>
+
+
 #ifndef NUD_VALID
 #define NUD_VALID                                                             \
   (NUD_PERMANENT | NUD_NOARP | NUD_REACHABLE | NUD_PROBE | NUD_STALE |        \
@@ -103,6 +106,9 @@ const static mfib_prefix_t ip6_specials[] = {
 static void
 lcp_nl_mk_ip_addr (const struct nl_addr *rna, ip_address_t *ia)
 {
+  if (!rna || !ia)
+    return;
+
   ip_address_reset (ia);
   ip_address_set (ia, nl_addr_get_binary_addr (rna),
 		  nl_addr_get_family (rna) == AF_INET6 ? AF_IP6 : AF_IP4);
@@ -342,8 +348,7 @@ lcp_nl_table_add_or_lock (uint32_t id, fib_protocol_t fproto)
 	  for (ii = 0; ii < ARRAY_LEN (ip4_specials); ii++)
 	    {
 	      mfib_table_entry_path_update (
-		nlt->nlt_mfib_index, &ip4_specials[ii], MFIB_SOURCE_PLUGIN_LOW,
-		MFIB_ENTRY_FLAG_NONE, &path);
+		nlt->nlt_mfib_index, &ip4_specials[ii], MFIB_SOURCE_PLUGIN_LOW, &path);
 	    }
 	}
       else if (FIB_PROTOCOL_IP6 == fproto)
@@ -362,8 +367,7 @@ lcp_nl_table_add_or_lock (uint32_t id, fib_protocol_t fproto)
 	  for (ii = 0; ii < ARRAY_LEN (ip6_specials); ii++)
 	    {
 	      mfib_table_entry_path_update (
-		nlt->nlt_mfib_index, &ip6_specials[ii], MFIB_SOURCE_PLUGIN_LOW,
-		MFIB_ENTRY_FLAG_NONE, &path);
+		nlt->nlt_mfib_index, &ip6_specials[ii], MFIB_SOURCE_PLUGIN_LOW, &path);
 	    }
 	}
     }
@@ -516,7 +520,7 @@ lcp_nl_route_add (struct rtnl_route *rr)
 
 	  mfib_table_entry_paths_update (nlt->nlt_mfib_index, &mpfx,
 					 MFIB_SOURCE_PLUGIN_LOW,
-					 MFIB_ENTRY_FLAG_NONE, np.paths);
+					 np.paths);
 	}
       else
 	{
@@ -853,8 +857,7 @@ lcp_nl_ip4_mroutes_add_del (u32 sw_if_index, u8 is_add)
       if (is_add)
 	{
 	  mfib_table_entry_path_update (mfib_index, &ip4_specials[ii],
-					MFIB_SOURCE_PLUGIN_LOW,
-					MFIB_ENTRY_FLAG_NONE, &path);
+					MFIB_SOURCE_PLUGIN_LOW, &path);
 	}
       else
 	{
@@ -887,12 +890,13 @@ lcp_nl_ip6_mroutes_add_del (u32 sw_if_index, u8 is_add)
 	{
 	  mfib_table_entry_path_update (mfib_index, &ip6_specials[ii],
 					MFIB_SOURCE_PLUGIN_LOW,
-					MFIB_ENTRY_FLAG_NONE, &path);
+					&path);
 	}
       else
 	{
 	  mfib_table_entry_path_remove (mfib_index, &ip6_specials[ii],
-					MFIB_SOURCE_PLUGIN_LOW, &path);
+					MFIB_SOURCE_PLUGIN_LOW,
+					&path);
 	}
     }
 }
@@ -958,9 +962,62 @@ lcp_nl_addr_del (struct rtnl_addr *ra)
   lcp_nl_addr_add_del (ra, 1);
 }
 
+typedef enum vtep_fdb_entry_type {
+  VTEP_FDB_ENTRY_REMOTE_TUNNEL_IP,
+  VTEP_FDB_ENTRY_MAC_IP_PAIR,
+} vtep_fdb_entry_type_t;
+
+typedef struct vtep_fdb_entry{
+  ip_address_t remote;
+  mac_address_t mac_address;
+  u32 vni;
+  vtep_fdb_entry_type_t type;
+} vtep_fdb_entry_t;
+
+bool 
+get_vtep_entry(struct rtnl_neigh *neigh, vtep_fdb_entry_t *entry)
+{
+  char buf[128] = {0};
+
+  if (neigh== NULL || entry == NULL)
+    return false;
+
+  memset(entry, 0, sizeof(vtep_fdb_entry_t));
+
+  int type = nl_object_get_msgtype ((struct nl_object *)neigh);
+  if (type != RTM_NEWNEIGH)
+    return false;
+
+  nl_af2str(rtnl_neigh_get_family(neigh), buf, sizeof(buf));
+  if (memcmp(buf, "bridge", sizeof("bridge")))
+    return false;
+
+  struct nl_addr *a;
+  if ((a = rtnl_neigh_get_lladdr(neigh)))
+    lcp_nl_mk_mac_addr(a , &entry->mac_address);
+  else
+    return false;
+
+  if ((a = rtnl_neigh_get_dst(neigh)))
+    lcp_nl_mk_ip_addr(a, &entry->remote);
+  else
+    return false;
+      
+  if (ethernet_mac_address_is_zero(entry->mac_address.bytes)
+        && !ip_address_is_zero(&entry->remote))
+    entry->type = VTEP_FDB_ENTRY_REMOTE_TUNNEL_IP;
+  else if (!ethernet_mac_address_is_zero(entry->mac_address.bytes)
+        && !ip_address_is_zero(&entry->remote))
+    entry->type = VTEP_FDB_ENTRY_MAC_IP_PAIR;
+
+  return true;
+}
+
 void
 lcp_nl_neigh_add (struct rtnl_neigh *rn)
 {
+  vtep_fdb_entry_t fdb_entry;
+  vxlan_main_t *vxm = &vxlan_main;
   lcp_itf_pair_t *lip;
   struct nl_addr *ll;
   ip_address_t nh;
@@ -974,6 +1031,33 @@ lcp_nl_neigh_add (struct rtnl_neigh *rn)
       NL_WARN ("neigh_add: no LCP for %U ", format_nl_object, rn);
       return;
     }
+
+  if (lip->lip_host_type == LCP_ITF_HOST_VXLAN)
+    {
+      if (!get_vtep_entry(rn, &fdb_entry))
+        return;
+
+      NL_INFO ("neigh_add: vxlan type 2 route MAC/IP %s %s",
+                 format (0, "%U", format_mac_address_t,  
+                 &fdb_entry.mac_address),
+                 format (0, "%U", format_ip46_address, &fdb_entry.remote.ip, 
+                 IP46_TYPE_IP4));
+
+      if (fdb_entry.type == VTEP_FDB_ENTRY_REMOTE_TUNNEL_IP)
+        {
+          //int sw_if_index = ~0;
+          //create_vxlan_remote_table(lip->lip_phy_sw_if_index, &fdb_entry.remote.ip);
+        }
+      else if (fdb_entry.type == VTEP_FDB_ENTRY_MAC_IP_PAIR)
+        {
+          //remote_vtep_ref(&vxm->remote_vtep_table,
+          //             &fdb_entry.remote.ip, fdb_entry.mac_address.bytes);
+        }
+      return;
+    }
+
+  if (!rtnl_neigh_get_dst (rn))
+    return;
 
   lcp_nl_mk_ip_addr (rtnl_neigh_get_dst (rn), &nh);
   ll = rtnl_neigh_get_lladdr (rn);
@@ -1022,6 +1106,13 @@ lcp_nl_neigh_del (struct rtnl_neigh *rn)
 	  lcp_itf_pair_find_by_vif (rtnl_neigh_get_ifindex (rn)))))
     {
       NL_WARN ("neigh_del: no LCP for %U ", format_nl_object, rn);
+      return;
+    }
+
+  // TODO: remove mac/ip into vpp
+  if (lip->lip_host_type == LCP_ITF_HOST_VXLAN)
+    {
+      NL_INFO ("neigh_add: vlxan LCP for %U ", format_nl_object, rn);
       return;
     }
 
